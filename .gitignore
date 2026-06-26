@@ -9,3 +9,7 @@ dist/
 .coverage
 htmlcov/
 *.tmp
+
+# runtime outputs
+triage_incidents.json
+*_baseline.json
