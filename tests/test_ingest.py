@@ -111,10 +111,10 @@ def test_opensearch_request_is_well_formed() -> None:
     config.opensearch.username = "admin"
     config.opensearch.password = "secret"
     source = OpenSearchAlertSource(config, reference_time=BASE_TIME)
-    request = source._build_request()  # internal, but valuable to verify
+    body = source._build_query_body()
+    request = source._build_request(body)  # internal, but valuable to verify
     assert request.full_url == "https://indexer:9200/wazuh-alerts-*/_search"
     assert request.get_header("Authorization").startswith("Basic ")
-    body = json.loads(request.data.decode("utf-8"))
     assert "range" in body["query"]
     assert body["sort"][0]["timestamp"]["order"] == "asc"
 
@@ -124,3 +124,116 @@ def test_build_source_factory_selects_backend() -> None:
     assert isinstance(build_source(file_cfg), FileAlertSource)
     os_cfg = IngestConfig(source="opensearch")
     assert isinstance(build_source(os_cfg), OpenSearchAlertSource)
+
+
+# ---------------------------------------------------------------------------
+# OpenSearch fetch: pagination and retry (offline, via a fake urlopen)
+# ---------------------------------------------------------------------------
+import json as _json
+import urllib.error
+import urllib.request
+from contextlib import contextmanager
+
+
+class _FakeResponse:
+    def __init__(self, payload: dict) -> None:
+        self._body = _json.dumps(payload).encode("utf-8")
+
+    def read(self) -> bytes:
+        return self._body
+
+    def __enter__(self) -> "_FakeResponse":
+        return self
+
+    def __exit__(self, *exc) -> bool:
+        return False
+
+
+def _hit(doc_id: str, offset: int):
+    return {
+        "_id": doc_id,
+        "_source": wazuh_alert(alert_id=doc_id, offset_seconds=offset, level=10),
+        "sort": [offset, doc_id],
+    }
+
+
+def test_opensearch_pagination_via_search_after(monkeypatch) -> None:
+    # page_size=2: first page returns 2 hits, second returns 1, then stop.
+    pages = [
+        {"hits": {"hits": [_hit("a", 0), _hit("b", 1)]}},
+        {"hits": {"hits": [_hit("c", 2)]}},
+    ]
+    calls = {"n": 0}
+
+    def fake_urlopen(request, timeout=None, context=None):
+        body = _json.loads(request.data.decode("utf-8"))
+        # First call has no search_after; subsequent calls do.
+        idx = 0 if "search_after" not in body else 1
+        calls["n"] += 1
+        return _FakeResponse(pages[idx])
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    cfg = IngestConfig(source="opensearch")
+    cfg.opensearch.page_size = 2
+    source = OpenSearchAlertSource(cfg, reference_time=BASE_TIME + timedelta(minutes=10))
+    alerts = source.fetch()
+    assert [a.alert_id for a in alerts] == ["a", "b", "c"]
+    assert calls["n"] == 2  # exactly two pages fetched
+
+
+def test_opensearch_retries_then_succeeds(monkeypatch) -> None:
+    attempts = {"n": 0}
+
+    def flaky_urlopen(request, timeout=None, context=None):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise urllib.error.URLError("connection refused")
+        return _FakeResponse({"hits": {"hits": [_hit("a", 0)]}})
+
+    monkeypatch.setattr(urllib.request, "urlopen", flaky_urlopen)
+    cfg = IngestConfig(source="opensearch")
+    cfg.opensearch.max_retries = 2
+    cfg.opensearch.retry_backoff_seconds = 0.0  # no real delay in tests
+    cfg.opensearch.page_size = 10
+    source = OpenSearchAlertSource(cfg, reference_time=BASE_TIME + timedelta(minutes=10))
+    alerts = source.fetch()
+    assert [a.alert_id for a in alerts] == ["a"]
+    assert attempts["n"] == 2  # failed once, succeeded on retry
+
+
+def test_opensearch_4xx_is_not_retried(monkeypatch) -> None:
+    attempts = {"n": 0}
+
+    def auth_fail(request, timeout=None, context=None):
+        attempts["n"] += 1
+        raise urllib.error.HTTPError(request.full_url, 401, "Unauthorized", {}, None)
+
+    monkeypatch.setattr(urllib.request, "urlopen", auth_fail)
+    cfg = IngestConfig(source="opensearch")
+    cfg.opensearch.max_retries = 3
+    source = OpenSearchAlertSource(cfg, reference_time=BASE_TIME)
+    with pytest.raises(IngestError, match="HTTP 401"):
+        source.fetch()
+    assert attempts["n"] == 1  # 4xx fails fast, no retries
+
+
+def test_opensearch_unreachable_raises_after_retries(monkeypatch) -> None:
+    def always_fail(request, timeout=None, context=None):
+        raise urllib.error.URLError("no route to host")
+
+    monkeypatch.setattr(urllib.request, "urlopen", always_fail)
+    cfg = IngestConfig(source="opensearch")
+    cfg.opensearch.max_retries = 1
+    cfg.opensearch.retry_backoff_seconds = 0.0
+    source = OpenSearchAlertSource(cfg, reference_time=BASE_TIME)
+    with pytest.raises(IngestError, match="Cannot reach indexer"):
+        source.fetch()
+
+
+def test_opensearch_query_uses_configured_timestamp_field() -> None:
+    cfg = IngestConfig(source="opensearch")
+    cfg.opensearch.timestamp_field = "@timestamp"
+    source = OpenSearchAlertSource(cfg, reference_time=BASE_TIME)
+    body = source._build_query_body()
+    assert "@timestamp" in body["query"]["range"]
+    assert body["sort"][0] == {"@timestamp": {"order": "asc"}}

@@ -83,22 +83,43 @@ Python 3.10+ is required.
 
 ## Usage
 
-Run once with all defaults (reads `/var/ossec/logs/alerts/alerts.json`):
+The default source is the **Wazuh indexer** (OpenSearch), which is the path that
+survives the Wazuh 5.0 upgrade (see "Wazuh 5.0 readiness" below). Point it at
+your indexer via config:
 
 ```bash
-wazuh-causal-triage run
+wazuh-causal-triage run --config config/config.example.yaml
 ```
 
-Run against a specific file or config:
+For Wazuh 4.x or local development, read a `alerts.json` file directly — the
+`--alerts` flag selects file mode for that run:
 
 ```bash
-wazuh-causal-triage run --alerts ./alerts.json
-wazuh-causal-triage run --config config/config.example.yaml
+wazuh-causal-triage run --alerts /var/ossec/logs/alerts/alerts.json
 ```
 
 Typical deployment is a cron job or systemd timer invoking `run` every few
 minutes. Exit codes: `0` success, `2` config error, `3` ingestion error,
 `1` unexpected error.
+
+## Wazuh 5.0 readiness
+
+In Wazuh 5.0, alerts are renamed **findings** and live exclusively on the
+indexer side. This module is built for that transition:
+
+- **Indexer-first.** The OpenSearch source is the default, with `search_after`
+  pagination, retry/backoff, and configurable TLS (CA bundle).
+- **Schema-tolerant parsing.** Each field is resolved by probing the 4.x nested
+  location first, then flatter ECS/indexer-aligned locations (e.g. `host.name`,
+  `process.entity_id`, `destination.ip`). The same build works on both shapes.
+- **Tunable for the new index.** Set `opensearch.index_pattern` to the findings
+  pattern and `opensearch.timestamp_field` to `@timestamp` if 5.0 adopts ECS
+  timestamps.
+
+> The ECS/findings field paths are *provisional* (marked `# 5.0/ECS` in the
+> source) and should be confirmed against the official 5.0 findings schema when
+> published. Because lookups are additive fallbacks, refining them never breaks
+> 4.x parsing.
 
 ---
 
@@ -109,8 +130,12 @@ to a documented default; an empty config is valid. Key knobs:
 
 | Key | Meaning |
 | --- | --- |
-| `ingest.source` | `file` or `opensearch` |
+| `ingest.source` | `opensearch` (default) or `file` |
+| `ingest.schema` | `auto` (default), `alerts` (4.x), or `findings` (5.0) |
 | `ingest.lookback_minutes` | only consider alerts newer than this |
+| `ingest.opensearch.index_pattern` | `wazuh-alerts-*` (4.x) or findings pattern (5.0) |
+| `ingest.opensearch.timestamp_field` | `timestamp` (4.x) or `@timestamp` (ECS/5.0) |
+| `ingest.opensearch.verify_certs` / `ca_cert_path` | TLS verification for production |
 | `graph.correlation_window_seconds` | max time gap for temporal linkage |
 | `graph.min_seed_level` | alerts at/below this level cannot start an incident |
 | `scoring.adaptive_k` | threshold = `mean + k·stddev` (clamped to a floor) |

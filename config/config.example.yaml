@@ -6,18 +6,31 @@
 log_level: INFO            # DEBUG | INFO | WARNING | ERROR | CRITICAL
 
 ingest:
-  source: file             # "file" (default) or "opensearch"
-  lookback_minutes: 60     # only consider alerts newer than this
+  # "opensearch" (default; reads the Wazuh indexer — the path forward for the
+  # Wazuh 5.0 "findings" model) or "file" (reads a local alerts.json; good for
+  # 4.x and development, also selectable ad hoc with `--alerts`).
+  source: opensearch
+  # How documents are interpreted: "auto" (probes both 4.x and ECS/findings
+  # field locations), "alerts" (4.x), or "findings" (5.0).
+  schema: auto
+  lookback_minutes: 60     # only consider alerts/findings newer than this
   max_alerts: 50000        # safety cap per run
   file:
     path: /var/ossec/logs/alerts/alerts.json
   opensearch:
     url: https://localhost:9200
+    # 4.x: wazuh-alerts-*  |  5.0: set to the findings index pattern once published
     index_pattern: wazuh-alerts-*
     username: admin
     password: ""           # supply via a secret manager in production
-    verify_certs: false    # set true with a trusted CA bundle in production
+    # 4.x uses "timestamp"; ECS/5.0 documents may use "@timestamp"
+    timestamp_field: timestamp
+    verify_certs: false    # set true in production
+    ca_cert_path: null     # path to CA bundle when verify_certs is true
     timeout_seconds: 30
+    page_size: 1000        # search_after pagination page size
+    max_retries: 2
+    retry_backoff_seconds: 1.0
 
 graph:
   correlation_window_seconds: 1800   # max gap for temporal linkage (30 min)

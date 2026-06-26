@@ -3,12 +3,13 @@
 
 Two sources are provided:
 
-* :class:`FileAlertSource` tails a Wazuh ``alerts.json`` file. It is the
-  default because it has zero external dependencies and is fully testable
-  offline.
 * :class:`OpenSearchAlertSource` queries the Wazuh indexer over HTTP using only
-  the Python standard library (``urllib``), so the module pulls in no heavy
-  HTTP client.
+  the Python standard library (``urllib``), with ``search_after`` pagination and
+  retry. This is the **default** and the forward-looking path: in Wazuh 5.0,
+  alerts (renamed "findings") live only on the indexer.
+* :class:`FileAlertSource` tails a Wazuh ``alerts.json`` file. It has zero
+  external dependencies and is fully testable offline, which suits 4.x
+  deployments and local development.
 
 Both implement :class:`AlertSource` and return already-normalized
 :class:`~wazuh_causal_triage.models.Alert` objects, filtered to the configured
@@ -21,11 +22,12 @@ import base64
 import json
 import logging
 import ssl
+import time
 import urllib.error
 import urllib.request
 from abc import ABC, abstractmethod
 from datetime import datetime, timedelta, timezone
-from typing import Iterator, Optional
+from typing import Optional
 
 from .config import IngestConfig
 from .models import Alert
@@ -117,71 +119,151 @@ class FileAlertSource(AlertSource):
 class OpenSearchAlertSource(AlertSource):
     """Query the Wazuh indexer (OpenSearch) for recent alerts.
 
-    Uses HTTP Basic auth and a bounded time-range query. TLS verification is
-    configurable; it defaults to off only because Wazuh ships self-signed certs
-    in default deployments, but operators should enable it in production with a
-    trusted CA bundle.
+    Uses HTTP Basic auth and a bounded time-range query, paginating with
+    ``search_after`` so a run is not capped at OpenSearch's single-page limit.
+    Transient failures are retried with linear backoff. TLS verification is
+    configurable: production deployments should set ``verify_certs: true`` and
+    point ``ca_cert_path`` at the indexer's CA bundle rather than disabling
+    verification.
     """
 
     def __init__(self, config: IngestConfig, reference_time: Optional[datetime] = None) -> None:
         self._config = config
         self._reference_time = reference_time or datetime.now(timezone.utc)
 
-    def _build_request(self) -> urllib.request.Request:
+    # ------------------------------------------------------------------
+    # Request construction
+    # ------------------------------------------------------------------
+    def _build_query_body(self, search_after: Optional[list] = None) -> dict:
+        """Build one page of the search request body.
+
+        Results are sorted by the configured timestamp field with ``_id`` as a
+        tiebreaker so ``search_after`` paginates deterministically even when
+        many documents share a timestamp.
+        """
         os_cfg = self._config.opensearch
+        ts_field = os_cfg.timestamp_field
         cutoff = self._reference_time - timedelta(minutes=self._config.lookback_minutes)
-        body = {
-            "size": min(self._config.max_alerts, 10_000),
-            "sort": [{"timestamp": {"order": "asc"}}],
+        body: dict = {
+            "size": os_cfg.page_size,
+            "sort": [{ts_field: {"order": "asc"}}, {"_id": {"order": "asc"}}],
             "query": {
                 "range": {
-                    "timestamp": {"gte": cutoff.isoformat(), "lte": self._reference_time.isoformat()}
+                    ts_field: {
+                        "gte": cutoff.isoformat(),
+                        "lte": self._reference_time.isoformat(),
+                    }
                 }
             },
         }
+        if search_after is not None:
+            body["search_after"] = search_after
+        return body
+
+    def _build_request(self, body: dict) -> urllib.request.Request:
+        os_cfg = self._config.opensearch
         url = f"{os_cfg.url.rstrip('/')}/{os_cfg.index_pattern}/_search"
         data = json.dumps(body).encode("utf-8")
         request = urllib.request.Request(url, data=data, method="POST")
         request.add_header("Content-Type", "application/json")
-        token = base64.b64encode(f"{os_cfg.username}:{os_cfg.password}".encode("utf-8")).decode("ascii")
+        token = base64.b64encode(
+            f"{os_cfg.username}:{os_cfg.password}".encode("utf-8")
+        ).decode("ascii")
         request.add_header("Authorization", f"Basic {token}")
         return request
 
+    def _ssl_context(self, url: str) -> Optional[ssl.SSLContext]:
+        os_cfg = self._config.opensearch
+        if not url.lower().startswith("https"):
+            return None
+        if os_cfg.verify_certs:
+            # Verify against a provided CA bundle, or the system trust store.
+            return ssl.create_default_context(cafile=os_cfg.ca_cert_path)
+        # Verification explicitly disabled (default for self-signed dev certs).
+        context = ssl.create_default_context()
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        return context
+
+    # ------------------------------------------------------------------
+    # HTTP with retry
+    # ------------------------------------------------------------------
+    def _execute(self, body: dict) -> dict:
+        """POST one search request, retrying transient failures."""
+        os_cfg = self._config.opensearch
+        request = self._build_request(body)
+        context = self._ssl_context(request.full_url)
+        last_error: Optional[Exception] = None
+
+        for attempt in range(os_cfg.max_retries + 1):
+            try:
+                with urllib.request.urlopen(
+                    request, timeout=os_cfg.timeout_seconds, context=context
+                ) as response:
+                    return json.loads(response.read().decode("utf-8"))
+            except urllib.error.HTTPError as exc:
+                # 4xx (e.g. auth, bad index) are not retryable; fail fast.
+                if exc.code < 500:
+                    raise IngestError(
+                        f"Indexer returned HTTP {exc.code} for {request.full_url}: {exc.reason}"
+                    ) from exc
+                last_error = exc
+            except urllib.error.URLError as exc:
+                last_error = exc
+            except json.JSONDecodeError as exc:
+                raise IngestError("Indexer returned a non-JSON response") from exc
+
+            if attempt < os_cfg.max_retries:
+                time.sleep(os_cfg.retry_backoff_seconds * (attempt + 1))
+
+        raise IngestError(
+            f"Cannot reach indexer at {os_cfg.url} after "
+            f"{os_cfg.max_retries + 1} attempt(s): {last_error}"
+        )
+
+    # ------------------------------------------------------------------
+    # Fetch with pagination
+    # ------------------------------------------------------------------
     def fetch(self) -> list[Alert]:
         os_cfg = self._config.opensearch
-        request = self._build_request()
-        context: Optional[ssl.SSLContext] = None
-        if request.full_url.lower().startswith("https") and not os_cfg.verify_certs:
-            context = ssl.create_default_context()
-            context.check_hostname = False
-            context.verify_mode = ssl.CERT_NONE
-
-        try:
-            with urllib.request.urlopen(
-                request, timeout=os_cfg.timeout_seconds, context=context
-            ) as response:
-                payload = json.loads(response.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            raise IngestError(
-                f"Indexer returned HTTP {exc.code} for {request.full_url}: {exc.reason}"
-            ) from exc
-        except urllib.error.URLError as exc:
-            raise IngestError(f"Cannot reach indexer at {os_cfg.url}: {exc.reason}") from exc
-        except json.JSONDecodeError as exc:
-            raise IngestError("Indexer returned a non-JSON response") from exc
-
-        hits = (((payload or {}).get("hits") or {}).get("hits")) or []
         alerts: list[Alert] = []
-        for hit in hits:
-            source = hit.get("_source") if isinstance(hit, dict) else None
-            if not isinstance(source, dict):
-                continue
-            # Preserve the indexer document id when the alert lacks its own.
-            source.setdefault("_id", hit.get("_id", ""))
-            alerts.append(Alert.from_wazuh(source))
+        seen_ids: set[str] = set()
+        search_after: Optional[list] = None
+        # Hard cap on pages defends against an unexpected non-advancing cursor.
+        max_pages = max(1, (self._config.max_alerts // max(os_cfg.page_size, 1)) + 1)
+
+        for _ in range(max_pages):
+            payload = self._execute(self._build_query_body(search_after))
+            hits = (((payload or {}).get("hits") or {}).get("hits")) or []
+            if not hits:
+                break
+
+            last_sort: Optional[list] = None
+            for hit in hits:
+                if not isinstance(hit, dict):
+                    continue
+                last_sort = hit.get("sort", last_sort)
+                source = hit.get("_source")
+                if not isinstance(source, dict):
+                    continue
+                doc_id = str(hit.get("_id", ""))
+                if doc_id and doc_id in seen_ids:
+                    continue  # Guard against overlap at page boundaries.
+                if doc_id:
+                    seen_ids.add(doc_id)
+                    source.setdefault("_id", doc_id)
+                alerts.append(Alert.from_wazuh(source))
+                if len(alerts) >= self._config.max_alerts:
+                    break
+
+            if len(alerts) >= self._config.max_alerts or len(hits) < os_cfg.page_size:
+                break
+            if last_sort is None:
+                break  # No cursor to continue from; stop rather than loop.
+            search_after = last_sort
 
         alerts.sort(key=lambda a: a.timestamp)
-        logger.info("Ingested %d alerts from indexer %s", len(alerts), os_cfg.url)
+        logger.info("Ingested %d alert(s)/finding(s) from indexer %s", len(alerts), os_cfg.url)
         return alerts
 
 

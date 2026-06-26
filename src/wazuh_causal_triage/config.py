@@ -38,25 +38,52 @@ class FileSourceConfig:
 
 @dataclass
 class OpenSearchSourceConfig:
-    """Settings for reading alerts from the Wazuh indexer (OpenSearch)."""
+    """Settings for reading alerts/findings from the Wazuh indexer (OpenSearch).
+
+    This is the forward-looking source: in Wazuh 5.0, alerts (renamed
+    "findings") live exclusively on the indexer side, so indexer retrieval is
+    the path that survives the upgrade.
+    """
 
     url: str = "https://localhost:9200"
+    # 4.x alerts use ``wazuh-alerts-*``. For 5.0 findings, set this to the
+    # findings index pattern once it is published (e.g. ``wazuh-findings-*``).
     index_pattern: str = "wazuh-alerts-*"
     username: str = "admin"
     password: str = ""
+    # The timestamp field used for range filtering and sort. 4.x uses
+    # ``timestamp``; ECS/5.0 documents may use ``@timestamp``.
+    timestamp_field: str = "timestamp"
     verify_certs: bool = False
+    # Path to a CA bundle for TLS verification in production. When set and
+    # ``verify_certs`` is true, the indexer's certificate is validated against
+    # it; strongly recommended over disabling verification.
+    ca_cert_path: Optional[str] = None
     timeout_seconds: float = 30.0
+    # Pagination: results are pulled in pages via ``search_after`` so runs are
+    # not limited to a single 10k OpenSearch page.
+    page_size: int = 1000
+    max_retries: int = 2
+    retry_backoff_seconds: float = 1.0
 
 
 @dataclass
 class IngestConfig:
     """Which alert source to use and its parameters.
 
-    ``source`` selects the backend: ``"file"`` (default, dependency-free and
-    fully offline-testable) or ``"opensearch"``.
+    ``source`` selects the backend: ``"opensearch"`` (default; reads the Wazuh
+    indexer and is the path forward for 5.0 findings) or ``"file"`` (reads a
+    local ``alerts.json``; dependency-free and fully offline-testable, suited to
+    4.x and to development).
+
+    ``schema`` selects how documents are interpreted: ``"auto"`` (default; the
+    parser probes both 4.x and ECS/findings field locations), ``"alerts"``
+    (4.x), or ``"findings"`` (5.0). In practice ``"auto"`` handles both because
+    field lookups are additive fallbacks.
     """
 
-    source: str = "file"
+    source: str = "opensearch"
+    schema: str = "auto"
     lookback_minutes: int = 60
     max_alerts: int = 50_000
     file: FileSourceConfig = field(default_factory=FileSourceConfig)
@@ -180,6 +207,14 @@ class AppConfig:
             raise ConfigError(
                 f"ingest.source must be 'file' or 'opensearch', got {self.ingest.source!r}"
             )
+        if self.ingest.schema not in ("auto", "alerts", "findings"):
+            raise ConfigError(
+                f"ingest.schema must be 'auto', 'alerts', or 'findings', got {self.ingest.schema!r}"
+            )
+        if self.ingest.opensearch.page_size <= 0:
+            raise ConfigError("ingest.opensearch.page_size must be a positive integer")
+        if self.ingest.opensearch.max_retries < 0:
+            raise ConfigError("ingest.opensearch.max_retries must be non-negative")
         if self.ingest.lookback_minutes <= 0:
             raise ConfigError("ingest.lookback_minutes must be a positive integer")
         if self.ingest.max_alerts <= 0:

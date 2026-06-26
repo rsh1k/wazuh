@@ -70,7 +70,50 @@ def test_alert_process_and_network_fields() -> None:
     assert alert.dest_port == "445"
 
 
-def test_alert_to_dict_drops_raw_and_isoformats_time() -> None:
+def test_alert_from_ecs_findings_shape() -> None:
+    # A flatter, ECS/indexer-aligned document (provisional 5.0 "findings"
+    # shape). The parser must map it via fallback field paths.
+    doc = {
+        "_id": "finding-1",
+        "@timestamp": "2026-06-26T09:00:00Z",
+        "rule": {"id": "92052", "level": 12, "description": "Suspicious PowerShell",
+                 "mitre": {"id": ["T1059.001"], "tactic": ["Execution"]}},
+        "host": {"name": "WIN-HOST", "ip": "192.168.1.50"},
+        "process": {
+            "entity_id": "{guid-1}",
+            "executable": "C:/Windows/System32/powershell.exe",
+            "parent": {"entity_id": "{guid-0}"},
+        },
+        "user": {"name": "Administrator"},
+        "destination": {"ip": "192.168.1.77", "port": 445},
+    }
+    alert = Alert.from_wazuh(doc)
+    assert alert.alert_id == "finding-1"
+    assert alert.rule_level == 12
+    assert alert.agent_name == "WIN-HOST"          # from host.name
+    assert alert.agent_ip == "192.168.1.50"        # from host.ip
+    assert alert.process_guid == "{guid-1}"        # from process.entity_id
+    assert alert.parent_process_guid == "{guid-0}"  # from process.parent.entity_id
+    assert alert.image.endswith("powershell.exe")  # from process.executable
+    assert alert.user == "Administrator"           # from user.name
+    assert alert.dest_ip == "192.168.1.77"         # from destination.ip
+    assert alert.dest_port == "445"                # coerced from int
+    assert alert.mitre_tactics == ("Execution",)
+    assert alert.timestamp.utcoffset().total_seconds() == 0
+
+
+def test_alert_4x_shape_still_parses_after_fallbacks() -> None:
+    # Regression guard: the classic 4.x nested shape must keep working.
+    doc = wazuh_alert(
+        alert_id="evt-1", level=10, agent_name="WIN-HOST",
+        process_guid="{P}", image="powershell.exe", user="Administrator",
+        dest_ip="10.0.0.9", dest_port="445",
+    )
+    alert = Alert.from_wazuh(doc)
+    assert alert.agent_name == "WIN-HOST"
+    assert alert.process_guid == "{P}"
+    assert alert.dest_ip == "10.0.0.9"
+    assert alert.dest_port == "445"
     alert = Alert.from_wazuh(wazuh_alert(alert_id="x"))
     payload = alert.to_dict()
     assert "raw" not in payload

@@ -83,6 +83,48 @@ def _parse_timestamp(raw: str) -> datetime:
     return parsed
 
 
+def _deep_get(doc: dict[str, Any], dotted_path: str) -> Any:
+    """Return the value at a dotted ``a.b.c`` path, or ``None`` if absent.
+
+    Tolerates missing keys and non-dict intermediate values at any level, so it
+    is safe to probe field locations that may or may not exist in a given
+    document shape.
+    """
+    current: Any = doc
+    for part in dotted_path.split("."):
+        if not isinstance(current, dict):
+            return None
+        current = current.get(part)
+        if current is None:
+            return None
+    return current
+
+
+def _first(doc: dict[str, Any], *dotted_paths: str) -> Any:
+    """Return the first non-empty value among several candidate dotted paths.
+
+    This is the core of cross-schema tolerance: a field that lives at
+    ``data.win.eventdata.processGuid`` in 4.x alerts may live at
+    ``process.entity_id`` in an ECS/indexer-aligned document, so we probe each
+    known location in priority order and take the first hit.
+    """
+    for path in dotted_paths:
+        value = _deep_get(doc, path)
+        if value not in (None, "", [], {}):
+            return value
+    return None
+
+
+def _first_str(doc: dict[str, Any], *dotted_paths: str) -> Optional[str]:
+    """Like :func:`_first`, but coerces the result to ``str`` (or ``None``).
+
+    Useful for fields such as a network port that arrive as an integer in
+    ECS/indexer documents but as a string in 4.x event data.
+    """
+    value = _first(doc, *dotted_paths)
+    return None if value is None else str(value)
+
+
 # ---------------------------------------------------------------------------
 # Alert
 # ---------------------------------------------------------------------------
@@ -119,18 +161,23 @@ class Alert:
 
     @staticmethod
     def from_wazuh(doc: dict[str, Any]) -> "Alert":
-        """Build an :class:`Alert` from a raw Wazuh alert document.
+        """Build an :class:`Alert` from a raw Wazuh document.
 
-        The method is defensive by construction: every lookup tolerates missing
-        keys, because real-world alert streams are heterogeneous and partial
-        documents must not abort ingestion.
+        The method is defensive by construction and **schema-tolerant**: for
+        every field it probes the known 4.x location first, then flatter
+        ECS/indexer-aligned locations. This lets the same parser handle both
+        today's ``alerts.json`` documents and the indexer-side "findings"
+        expected in Wazuh 5.0.
+
+        .. note::
+           The ECS/findings field paths below are *provisional*. They follow
+           Elastic Common Schema conventions that Wazuh has been migrating
+           toward, but the official 5.0 findings mapping was not yet published
+           when this was written. Confirm and adjust the paths marked
+           ``# 5.0/ECS`` against the released schema. Because lookups are
+           additive fallbacks, adding a path never breaks 4.x parsing.
         """
         rule = doc.get("rule") or {}
-        agent = doc.get("agent") or {}
-        data = doc.get("data") or {}
-        win = data.get("win") or {}
-        eventdata = win.get("eventdata") or {}
-
         mitre = rule.get("mitre") or {}
 
         def _as_tuple(value: Any) -> tuple[str, ...]:
@@ -140,31 +187,72 @@ class Alert:
                 return tuple(str(v) for v in value)
             return (str(value),)
 
-        # Rule level is occasionally delivered as a string; coerce safely.
+        # Rule level may be nested under rule.level (4.x) or be a string.
+        level_raw = _first(doc, "rule.level", "rule_level")
         try:
-            level = int(rule.get("level", 0))
+            level = int(level_raw) if level_raw is not None else 0
         except (TypeError, ValueError):
             level = 0
 
         return Alert(
-            alert_id=str(doc.get("id") or doc.get("_id") or ""),
-            timestamp=_parse_timestamp(str(doc.get("timestamp", ""))),
-            rule_id=str(rule.get("id", "")),
+            alert_id=str(_first(doc, "id", "_id") or ""),
+            timestamp=_parse_timestamp(str(_first(doc, "timestamp", "@timestamp") or "")),
+            rule_id=str(_first(doc, "rule.id", "rule.rule_id") or ""),
             rule_level=level,
-            description=str(rule.get("description", "")),
-            agent_id=str(agent.get("id", "")),
-            agent_name=str(agent.get("name", "")),
-            agent_ip=str(agent.get("ip", "")),
-            groups=_as_tuple(rule.get("groups")),
-            mitre_ids=_as_tuple(mitre.get("id")),
-            mitre_tactics=_as_tuple(mitre.get("tactic")),
-            process_guid=(eventdata.get("processGuid") or None),
-            parent_process_guid=(eventdata.get("parentProcessGuid") or None),
-            image=(eventdata.get("image") or None),
-            parent_image=(eventdata.get("parentImage") or None),
-            user=(eventdata.get("user") or eventdata.get("targetUserName") or None),
-            dest_ip=(eventdata.get("destinationIp") or None),
-            dest_port=(eventdata.get("destinationPort") or None),
+            description=str(_first(doc, "rule.description", "rule.name") or ""),
+            agent_id=str(_first(doc, "agent.id", "agent.agent_id") or ""),
+            # 4.x: agent.name; 5.0/ECS: host.name.
+            agent_name=str(_first(doc, "agent.name", "host.name", "host.hostname") or ""),
+            agent_ip=str(_first(doc, "agent.ip", "host.ip", "agent.address") or ""),
+            groups=_as_tuple(_first(doc, "rule.groups")),
+            mitre_ids=_as_tuple(mitre.get("id") if mitre else _first(doc, "rule.mitre.id")),
+            mitre_tactics=_as_tuple(
+                mitre.get("tactic") if mitre else _first(doc, "rule.mitre.tactic")
+            ),
+            # 4.x: data.win.eventdata.*; 5.0/ECS: process.* / user.* / destination.*
+            process_guid=_first(
+                doc,
+                "data.win.eventdata.processGuid",
+                "process.entity_id",  # 5.0/ECS
+                "data.process.entity_id",
+            ),
+            parent_process_guid=_first(
+                doc,
+                "data.win.eventdata.parentProcessGuid",
+                "process.parent.entity_id",  # 5.0/ECS
+                "data.process.parent.entity_id",
+            ),
+            image=_first(
+                doc,
+                "data.win.eventdata.image",
+                "process.executable",  # 5.0/ECS
+                "process.name",
+            ),
+            parent_image=_first(
+                doc,
+                "data.win.eventdata.parentImage",
+                "process.parent.executable",  # 5.0/ECS
+                "process.parent.name",
+            ),
+            user=_first(
+                doc,
+                "data.win.eventdata.user",
+                "data.win.eventdata.targetUserName",
+                "user.name",  # 5.0/ECS
+                "user.target.name",
+            ),
+            dest_ip=_first(
+                doc,
+                "data.win.eventdata.destinationIp",
+                "destination.ip",  # 5.0/ECS
+                "data.dest_ip",
+            ),
+            dest_port=_first_str(
+                doc,
+                "data.win.eventdata.destinationPort",
+                "destination.port",  # 5.0/ECS
+                "data.dest_port",
+            ),
             raw=doc,
         )
 

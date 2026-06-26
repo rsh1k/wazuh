@@ -12,10 +12,21 @@ from wazuh_causal_triage.config import AppConfig, ConfigError
 
 def test_defaults_are_valid() -> None:
     config = AppConfig.from_dict({})
-    assert config.ingest.source == "file"
+    assert config.ingest.source == "opensearch"
+    assert config.ingest.schema == "auto"
     assert config.scoring.absolute_floor == 45.0
     assert config.narrative.backend == "template"
     config.validate()  # must not raise
+
+
+def test_invalid_schema_rejected() -> None:
+    with pytest.raises(ConfigError, match="ingest.schema"):
+        AppConfig.from_dict({"ingest": {"schema": "ecs-ish"}})
+
+
+def test_invalid_page_size_rejected() -> None:
+    with pytest.raises(ConfigError, match="page_size"):
+        AppConfig.from_dict({"ingest": {"opensearch": {"page_size": 0}}})
 
 
 def test_partial_override_merges_with_defaults() -> None:
